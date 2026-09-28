@@ -13,6 +13,8 @@ SERVER_CMD="llama-server"
 # Defaults (The Sweet Spot)
 DEFAULT_FLAGS="--mlock --ngl 52 --ctx-size 32768 --threads 16 --numa --flash-attn --temp 0.7"
 
+DALPACA_HOME="$HOME/.dalpaca"
+
 # --- Helpers ---
 
 # Resolve model path from filename, relative path, or absolute path
@@ -43,6 +45,130 @@ resolve_model() {
     return 1
 }
 
+# --- Registry Helpers ---
+
+# Ensure ~/.dalpaca directory exists
+init_registry() {
+    mkdir -p "$DALPACA_HOME" 2>/dev/null || true
+}
+
+# Register a model: dalpaca register <name> -f <config_file>
+cmd_register() {
+    local name=""
+    local config_file=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--file)
+                shift
+                config_file="$1"
+                shift
+                ;;
+            -*)
+                echo "Unknown flag: $1" >&2
+                echo "Usage: dalpaca register <name> -f <config_file>" >&2
+                exit 1
+                ;;
+            *)
+                if [[ -z "$name" ]]; then
+                    name="$1"
+                    shift
+                else
+                    echo "Unknown argument: $1" >&2
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        echo "Usage: dalpaca register <name> -f <config_file>" >&2
+        exit 1
+    fi
+
+    if [[ -z "$config_file" ]]; then
+        echo "Usage: dalpaca register <name> -f <config_file>" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$config_file" ]]; then
+        echo "Error: Config file '$config_file' not found." >&2
+        exit 1
+    fi
+
+    # Validate config has -m flag
+    local model_path
+    model_path=$(grep -E '^-m ' "$config_file" | awk '{print $2}')
+    if [[ -z "$model_path" ]]; then
+        echo "Error: Config file must contain a '-m' flag pointing to a model." >&2
+        exit 1
+    fi
+
+    init_registry
+
+    # Store config file content in ~/.dalpaca/<name>.txt
+    cp "$config_file" "$DALPACA_HOME/${name}.txt"
+    echo "✅ Registered model '$name' → $DALPACA_HOME/${name}.txt"
+}
+
+# Resolve a registered model name to its config path
+resolve_registered_model() {
+    local name="$1"
+    local reg_file="$DALPACA_HOME/${name}.txt"
+
+    if [[ -f "$reg_file" ]]; then
+        echo "$reg_file"
+        return 0
+    fi
+
+    return 1
+}
+
+# List registered models
+cmd_list() {
+    init_registry
+
+    echo "📋 Registered Models:"
+    echo "-------------------------------------------"
+
+    local found=0
+    for reg_file in "$DALPACA_HOME"/*.txt; do
+        [[ -f "$reg_file" ]] || continue
+        found=1
+        local name
+        name=$(basename "$reg_file" .txt)
+        local model_path
+        model_path=$(grep -E '^-m ' "$reg_file" | awk '{print $2}')
+        echo "  📌 $name  →  $model_path"
+    done
+
+    if [[ $found -eq 0 ]]; then
+        echo "  (No registered models)"
+    fi
+    echo "-------------------------------------------"
+}
+
+# Remove a registered model
+cmd_rm() {
+    local name="$1"
+
+    if [[ -z "$name" ]]; then
+        echo "Usage: dalpaca rm <name>" >&2
+        exit 1
+    fi
+
+    local reg_file="$DALPACA_HOME/${name}.txt"
+
+    if [[ ! -f "$reg_file" ]]; then
+        echo "Error: No registered model '$name'." >&2
+        exit 1
+    fi
+
+    rm -f "$reg_file"
+    echo "✅ Removed registered model '$name'."
+}
+
+
 # --- Commands ---
 
 cmd_run() {
@@ -68,6 +194,12 @@ cmd_run() {
     if [[ -z "$config_file" ]]; then
         echo "Usage: dalpaca run <model_filename.txt | model_name>" >&2
         exit 1
+    fi
+
+    # 1a. Check if argument is a registered model name
+    local reg_path
+    if reg_path=$(resolve_registered_model "$config_file"); then
+        config_file="$reg_path"
     fi
 
     if [[ -f "$config_file" ]]; then
@@ -119,6 +251,12 @@ cmd_server() {
         exit 1
     fi
 
+    # 1a. Check if argument is a registered model name
+    local reg_path
+    if reg_path=$(resolve_registered_model "$config_file"); then
+        config_file="$reg_path"
+    fi
+
     if [[ -f "$config_file" ]]; then
         echo "📄 Using configuration from: $config_file"
         model_name=$(grep -E '^-m ' "$config_file" | awk '{print $2}')
@@ -152,7 +290,7 @@ cmd_stop() {
     echo "✅ All instances stopped."
 }
 
-cmd_list() {
+cmd_ps() {
     echo "📋 Currently Running Models:"
     echo "-------------------------------------------"
     ps aux | grep "[l]lama" | while read -r line; do
@@ -175,7 +313,10 @@ cmd_help() {
     echo "  dalpaca server <model_name>           Run in Server mode (Daemonized/Web UI)"
     echo "  dalpaca server <config.txt>           Run server using a config file"
     echo "  dalpaca stop                          Stop all models"
-    echo "  dalpaca list                          Show running models"
+    echo "  dalpaca ps                          Show running models"
+    echo "  dalpaca register <name> -f <config>  Register a model config"
+    echo "  dalpaca list                          List registered models"
+    echo "  dalpaca rm <name>                     Remove a registered model"
     echo ""
     echo "Config file (.txt) format:"
     echo "  -m /path/to/model.gguf"
@@ -195,7 +336,10 @@ case "$1" in
     run)    shift; cmd_run "$@" ;;
     server) shift; cmd_server "$@" ;;
     stop)   cmd_stop ;;
-    list|ls) cmd_list ;;
+    ps) cmd_ps ;;
+    register) shift; cmd_register "$@" ;;
+    list|ls)  cmd_list ;;
+    rm)       shift; cmd_rm "$@" ;;
     help)   cmd_help ;;
     *)      echo "Unknown command: $1"; cmd_help; exit 1 ;;
 esac
