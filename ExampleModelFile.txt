@@ -1,0 +1,23 @@
+# Example Model File Usage.
+# Use any llama.cpp flags directly, and allows for default system prompt additions
+
+#Runs the model file in the current directory
+-m Qwen3.8-27B-Q4_K_M.gguf
+
+# Offload 12 layers to CPU to keep KV cache headroom
+--ngl 52
+
+# 32k Context (Sweet spot for stability vs speed)
+--ctx-size 32768
+
+# Hardware optimization flags
+--threads 16
+--numa
+--flash-attn
+
+# Temp settings
+--temp 0.8
+--top_p 0.9
+
+# System Prompt / Persona
+--system "You are a coding expert specializing in clean code architeture"
