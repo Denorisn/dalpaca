@@ -12,15 +12,19 @@ SERVER_CMD="llama-server"
 
 # Defaults (The Sweet Spot)
 DEFAULT_FLAGS="--mlock --ngl 52 --ctx-size 32768 --threads 16 --numa --flash-attn --temp 0.7"
+DALPACA_VERSION="0.1.0"
 
 DALPACA_HOME="$HOME/.dalpaca"
+
+# llama.cpp binary directory (set via `dalpaca set-llama`)
+LLAMA_DIR=""
 
 # --- Helpers ---
 
 # Resolve model path from filename, relative path, or absolute path
 resolve_model() {
     local model_name="$1"
-    
+
     # 1. Check current working directory (Terminal path)
     if [[ -f "./$model_name" ]]; then
         echo "./$model_name"
@@ -148,6 +152,108 @@ cmd_list() {
     echo "-------------------------------------------"
 }
 
+# --- llama.cpp Binary Directory ---
+# Config file to store llama.cpp directory
+LLAMA_CONF="$DALPACA_HOME/llama_dir.conf"
+
+# Resolve llama.cpp binary path
+resolve_llama_cmd() {
+    local cmd_name="$1"
+
+    # If user set a custom directory
+    if [[ -n "$LLAMA_DIR" && -f "$LLAMA_DIR/$cmd_name" ]]; then
+        echo "$LLAMA_DIR/$cmd_name"
+        return 0
+    fi
+
+    # If directory is configured but binary not found there
+    if [[ -n "$LLAMA_DIR" ]]; then
+        echo "Error: '$cmd_name' not found in $LLAMA_DIR" >&2
+        return 1
+    fi
+
+    # Fall back to PATH lookup
+    if command -v "$cmd_name" &>/dev/null; then
+        command -v "$cmd_name"
+        return 0
+    fi
+
+    echo "Error: '$cmd_name' not found in PATH. Use 'dalpaca set-llama <directory>' to configure." >&2
+    return 1
+}
+
+cmd_set_llama() {
+    local dir=""
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -*)
+                echo "Unknown flag: $1" >&2
+                echo "Usage: dalpaca set-llama [directory]" >&2
+                exit 1
+                ;;
+            *)
+                if [[ -z "$dir" ]]; then
+                    dir="$1"
+                else
+                    echo "Unknown argument: $1" >&2
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # If no directory provided, prompt user
+    if [[ -z "$dir" ]]; then
+        echo "Enter the path to your llama.cpp build directory:"
+        read -r dir
+    fi
+
+    # Validate directory
+    if [[ -z "$dir" ]]; then
+        echo "Error: No directory provided." >&2
+        exit 1
+    fi
+
+    # Check if directory exists
+    if [[ ! -d "$dir" ]]; then
+        echo "Error: Directory '$dir' does not exist." >&2
+        exit 1
+    fi
+
+    # Check for llama-cli and llama-server in directory
+    local has_cli=0
+    local has_server=0
+    [[ -f "$dir/llama-cli" ]] && has_cli=1
+    [[ -f "$dir/llama-server" ]] && has_server=1
+
+    if [[ $has_cli -eq 0 && $has_server -eq 0 ]]; then
+        echo "Error: Neither 'llama-cli' nor 'llama-server' found in '$dir'." >&2
+        echo "Please provide a valid llama.cpp build directory." >&2
+        exit 1
+    fi
+
+    # Store directory
+    init_registry
+    echo "$dir" > "$LLAMA_CONF"
+
+    echo "✅ llama.cpp directory set to: $dir"
+    echo "   Found: $([ $has_cli -eq 1 ] && echo 'llama-cli' || echo '') $([ $has_server -eq 1 ] && echo '+ llama-server' || echo '')"
+}
+
+# Load llama.cpp directory from config if set
+load_llama_config() {
+    if [[ -f "$LLAMA_CONF" ]]; then
+        LLAMA_DIR=$(cat "$LLAMA_CONF" 2>/dev/null)
+        # Validate directory still exists
+        if [[ ! -d "$LLAMA_DIR" ]]; then
+            LLAMA_DIR=""
+        fi
+    fi
+}
+
 # Remove a registered model
 cmd_rm() {
     local name="$1"
@@ -169,27 +275,559 @@ cmd_rm() {
 }
 
 
+# --- GGUF & GPU Helpers ---
+
+# Parse GGUF header to extract model metadata
+# Sets global: GGUF_ARCH, GGUF_PARAMS, GGUF_BLOCK_COUNT, GGUF_EMBEDDING, GGUF_KV_COUNT
+parse_gguf() {
+    local model_path="$1"
+
+    if [[ ! -f "$model_path" ]]; then
+        return 1
+    fi
+
+    # Validate magic (GGUF)
+    local magic
+    magic=$(dd if="$model_path" bs=1 count=4 2>/dev/null | od -A n -t x1 | tr -d ' \n')
+    if [[ "$magic" != "47475546" ]]; then
+        echo "Error: '$model_path' is not a valid GGUF file." >&2
+        return 1
+    fi
+
+    # Validate version
+    local version
+    version=$(dd if="$model_path" bs=1 skip=4 count=4 2>/dev/null | od -A n -t u4 | tr -d ' ')
+    if [[ "$version" != "3" ]]; then
+        echo "Error: Unsupported GGUF version $version (need v3)." >&2
+        return 1
+    fi
+
+    # Read kv_count (u64 LE at offset 16)
+    local kv_count
+    kv_count=$(dd if="$model_path" bs=1 skip=16 count=8 2>/dev/null | od -A n -t u8 | tr -d ' ')
+
+    # Read the KV header section into a temp file for fast searching
+    local tmp_hdr
+    tmp_hdr=$(mktemp)
+    dd if="$model_path" bs=1 skip=24 count=2097152 2>/dev/null > "$tmp_hdr"
+
+    GGUF_ARCH=""
+    GGUF_PARAMS=""
+    GGUF_BLOCK_COUNT=""
+    GGUF_EMBEDDING=""
+
+    # Helper: read u64 LE at byte offset from tmp file
+    _read_u64_le() {
+        dd if="$tmp_hdr" bs=1 skip="$1" count=8 2>/dev/null | od -A n -t u8 | tr -d ' '
+    }
+
+    # Helper: read u32 LE at byte offset from tmp file
+    _read_u32_le() {
+        dd if="$tmp_hdr" bs=1 skip="$1" count=4 2>/dev/null | od -A n -t u4 | tr -d ' '
+    }
+
+    # Helper: extract a null-terminated string at byte offset
+    _read_cstr() {
+        dd if="$tmp_hdr" bs=1 skip="$1" count="$2" 2>/dev/null
+    }
+
+    # Search for each target key, get its byte offset via grep -boa
+    for target_key in "general.architecture" "general.parameter_count" "block_count" "embedding_length"; do
+        local match_line
+        match_line=$(grep -boa "$target_key" "$tmp_hdr" 2>/dev/null | head -1)
+        if [[ -z "$match_line" ]]; then
+            continue
+        fi
+
+        local key_off="${match_line%%:*}"
+        local key_len
+        key_len=$(_read_u64_le $((key_off - 8)))
+
+        local val_off=$((key_off + key_len))
+        local val_type
+        val_type=$(_read_u32_le "$val_off")
+
+        local val=""
+        case "$val_type" in
+            1)
+                val=$(_read_u32_le $((val_off + 4)))
+                ;;
+            6)
+                local str_len
+                str_len=$(_read_u64_le $((val_off + 4)))
+                val=$(_read_cstr $((val_off + 12)) "$str_len")
+                ;;
+            10|11)
+                val=$(_read_u32_le $((val_off + 4)))
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        case "$target_key" in
+            general.architecture)     GGUF_ARCH="$val" ;;
+            general.parameter_count)  GGUF_PARAMS="$val" ;;
+            block_count)              GGUF_BLOCK_COUNT="$val" ;;
+            embedding_length)         GGUF_EMBEDDING="$val" ;;
+        esac
+
+        if [[ -n "$GGUF_ARCH" && -n "$GGUF_BLOCK_COUNT" && -n "$GGUF_EMBEDDING" ]]; then
+            rm -f "$tmp_hdr"
+            return 0
+        fi
+    done
+
+    rm -f "$tmp_hdr"
+
+    if [[ -z "$GGUF_ARCH" || -z "$GGUF_BLOCK_COUNT" ]]; then
+        echo "Warning: Could not parse full GGUF metadata." >&2
+        return 1
+    fi
+
+    return 0
+}
+
+
+# Get available VRAM from rocm-smi (AMD) or nvidia-smi (NVIDIA)
+# Returns bytes on stdout; returns 1 on failure
+get_vram() {
+    local vram_bytes=""
+
+    # --- AMD GPU (rocm-smi) ---
+    if command -v rocm-smi &>/dev/null; then
+        vram_bytes=$(rocm-smi --showmeminfo vram 2>/dev/null \
+            | grep "VRAM Total Memory" \
+            | head -1 \
+            | grep -oP '\d+' | tail -1)
+        if [[ -n "$vram_bytes" ]]; then
+            echo "$vram_bytes"
+            return 0
+        fi
+    fi
+
+    # --- NVIDIA GPU (nvidia-smi) ---
+    if command -v nvidia-smi &>/dev/null; then
+        # nvidia-smi reports memory.total in MB; convert to bytes
+        local vram_mb
+        vram_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d '[:space:]')
+        if [[ -n "$vram_mb" && "$vram_mb" =~ ^[0-9]+$ ]]; then
+            echo $(( vram_mb * 1048576 ))
+            return 0
+        fi
+
+        # Fallback: parse verbose output (multi-GPU)
+        local nvidia_total
+        nvidia_total=$(nvidia-smi --query-gpu=memory.total --format=csv 2>/dev/null \
+            | grep -E '^[0-9]+ [0-9]+' | head -1 \
+            | awk '{print $1}')
+        if [[ -n "$nvidia_total" && "$nvidia_total" =~ ^[0-9]+$ ]]; then
+            echo $(( nvidia_total * 1048576 ))
+            return 0
+        fi
+    fi
+
+    echo "Error: No supported GPU tool found (rocm-smi or nvidia-smi)." >&2
+    return 1
+}
+
+# Convert bytes to human-readable string
+human_bytes() {
+    local bytes=$1
+    if (( bytes >= 1073741824 )); then
+        echo "$(awk "BEGIN {printf \"%.1f\", $bytes/1073741824}") GB"
+    elif (( bytes >= 1048576 )); then
+        echo "$(awk "BEGIN {printf \"%.1f\", $bytes/1048576}") MB"
+    elif (( bytes >= 1024 )); then
+        echo "$(awk "BEGIN {printf \"%.1f\", $bytes/1024}") KB"
+    else
+        echo "$bytes B"
+    fi
+}
+
+# Calculate recommended settings and print report
+calculate_recommendations() {
+    local model_path="$1"
+
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║              GPU Offload & Context Calculator            ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo ""
+
+    # Parse model metadata
+    if ! parse_gguf "$model_path"; then
+        return 1
+    fi
+
+    # Get VRAM
+    local vram_bytes
+    if ! vram_bytes=$(get_vram); then
+        return 1
+    fi
+
+    local vram_gb
+    vram_gb=$(awk "BEGIN {printf \"%.1f\", $vram_bytes/1073741824}")
+
+    echo "Model:  $(basename "$model_path")"
+    echo "Arch:   $GGUF_ARCH"
+    echo "Params: $(awk "BEGIN {printf \"%.1f\", $GGUF_PARAMS/1000000000}")B"
+    echo "Layers: $GGUF_BLOCK_COUNT"
+    echo "Embed:  $GGUF_EMBEDDING"
+    echo "VRAM:   $(human_bytes $vram_bytes)"
+    echo ""
+    echo "──────────────────────────────────────────────────────────"
+    echo ""
+
+    # Estimate model weight memory (approximate based on file size)
+    local file_size
+    file_size=$(stat -c%s "$model_path" 2>/dev/null || echo "0")
+    local weight_gb
+    weight_gb=$(awk "BEGIN {printf \"%.2f\", $file_size/1073741824}")
+    local weight_mb=$(( file_size / 1048576 ))
+
+    local layer_mb=$(( weight_mb / GGUF_BLOCK_COUNT ))
+    echo "Each layer ≈ ${layer_mb} MB (weight only)"
+    echo "Total weights: $(human_bytes $file_size)"
+    echo ""
+
+    # Reserve 2GB for OS, system, and safety margin
+    local reserve_bytes=$(( 2 * 1073741824 ))
+    local usable_vram=$(( vram_bytes - reserve_bytes ))
+
+    if (( usable_vram <= 0 )); then
+        echo "Warning: Usable VRAM after OS reserve: $(human_bytes $usable_vram)"
+        usable_vram=$vram_bytes
+    fi
+
+    # Per-layer memory = weight per layer + KV overhead per layer
+    # For each KV type, KV per layer = 2 × embedding_length × ctx_size × bytes_per_token
+
+    printf "%-10s | %-8s | %-10s | %-10s | %-10s\n" \
+        "KV Type" "Layers" "GPU Mem" "Reserve" "Max Ctx"
+    printf "%-10s-+-%-8s-+-%-10s-+-%-10s-+-%-10s\n" \
+        "$(printf '%0.s-' {1..10})" "$(printf '%0.s-' {1..8})" "$(printf '%0.s-' {1..10})" "$(printf '%0.s-' {1..10})" "$(printf '%0.s-' {1..10})"
+
+    # KV types: F16 (2B/entry), Q8 (1B/entry), Q4 (0.5B/entry)
+    # KV size per token per layer = 2 (key+value) × embedding_length × bytes_per_entry
+    # Total KV = block_count × ctx_size × KV_per_token_per_layer
+
+    local ctx_options=(1024 2048 4096 8192 16384 32768 65536)
+
+    for kv_bytes in "2" "1" "0.5"; do
+        local kv_label
+        case $kv_bytes in
+            "2") kv_label="F16";;
+            "1") kv_label="Q8_0";;
+            "0.5") kv_label="Q4_0";;
+        esac
+
+        # How many layers can fit given a ctx_size?
+        # usable = layer_weight × layers + block_count × ctx × embedding × 2 × kv_bytes
+        # => layers = (usable - block_count × ctx × embed × 2 × kv) / layer_weight
+
+        local max_ngl=0
+        local best_ctx=0
+
+        for ctx in "${ctx_options[@]}"; do
+            local kv_size=$(( GGUF_BLOCK_COUNT * ctx * GGUF_EMBEDDING * 2 ))
+            # kv_size is in token-elements; convert to bytes using kv_bytes
+            local kv_size_bytes
+            kv_size_bytes=$(awk "BEGIN {printf \"%d\", $kv_size * $kv_bytes}")
+
+            local remaining=$(( usable_vram - kv_size_bytes ))
+            if (( remaining <= 0 )); then
+                continue
+            fi
+
+            # Max layers that fit in remaining VRAM
+            local max_layers
+            max_layers=$(awk "BEGIN {v=int($remaining / ($weight_mb * 1048576 / $GGUF_BLOCK_COUNT)); if(v>$GGUF_BLOCK_COUNT) v=$GGUF_BLOCK_COUNT; print v}")
+
+            if (( max_layers > 0 && max_layers > max_ngl )); then
+                max_ngl=$max_layers
+                best_ctx=$ctx
+            fi
+        done
+
+        if (( max_ngl > 0 )); then
+            local gpu_mem_bytes
+            gpu_mem_bytes=$(awk "BEGIN {printf \"%d\", $max_ngl * $weight_mb * 1048576 / $GGUF_BLOCK_COUNT}")
+
+            local reserve_bytes
+            reserve_bytes=$(awk "BEGIN {printf \"%d\", $usable_vram - $max_ngl * $weight_mb * 1048576 / $GGUF_BLOCK_COUNT}")
+            printf "%-10s | %-8d | %-10s | %-10s | %-10s\n" \
+                "$kv_label" \
+                "$max_ngl" \
+                "$(human_bytes $gpu_mem_bytes)" \
+                "$(human_bytes $reserve_bytes)" \
+                "$best_ctx"
+        else
+            printf "%-10s | %-8s | %-10s | %-10s | %-10s\n" \
+                "$kv_label" "—" "—" "—" "—"
+        fi
+    done
+
+    echo ""
+    echo "──────────────────────────────────────────────────────────"
+    echo ""
+    echo "💡 Copy these into your config file:"
+    echo ""
+
+    # Pick the best recommendation (Q8 KV with largest context that fits)
+    # For simplicity, recommend Q8 with ctx=32768 if it fits, else Q4
+    local rec_ngl=52
+    local rec_ctx=32768
+    local rec_kv="Q8"
+
+    # Check if Q8 at 32768 fits
+    local q8_kv_bytes
+    q8_kv_bytes=$(awk "BEGIN {printf \"%d\", $GGUF_BLOCK_COUNT * 32768 * $GGUF_EMBEDDING * 2 * 1}")
+    local q8_remaining=$(( usable_vram - q8_kv_bytes ))
+    if (( q8_remaining > 0 )); then
+        rec_ngl=$(awk "BEGIN {v=int($q8_remaining / ($weight_mb * 1048576 / $GGUF_BLOCK_COUNT)); if(v>$GGUF_BLOCK_COUNT) v=$GGUF_BLOCK_COUNT; if(v<1) v=0; print v}")
+        rec_kv="Q8"
+    else
+        # Check Q4 at 32768
+        local q4_kv_bytes
+        q4_kv_bytes=$(awk "BEGIN {printf \"%d\", $GGUF_BLOCK_COUNT * 32768 * $GGUF_EMBEDDING * 2 * 0.5}")
+        local q4_remaining=$(( usable_vram - q4_kv_bytes ))
+        if (( q4_remaining > 0 )); then
+            rec_ngl=$(awk "BEGIN {v=int($q4_remaining / ($weight_mb * 1048576 / $GGUF_BLOCK_COUNT)); if(v>$GGUF_BLOCK_COUNT) v=$GGUF_BLOCK_COUNT; if(v<1) v=0; print v}")
+            rec_kv="Q4"
+        fi
+    fi
+
+    # Map recommendation KV type to llama.cpp cache-type flag value
+    local rec_kv_flag
+    case "$rec_kv" in
+        F16) rec_kv_flag="f16" ;;
+        Q8)  rec_kv_flag="q8_0" ;;
+        *)   rec_kv_flag="q4_0" ;;
+    esac
+
+    echo "  # Recommended config for $(basename "$model_path")"
+    echo "  -m $model_path"
+    echo "  --ngl $rec_ngl"
+    echo "  --ctx-size $rec_ctx"
+    echo "  --cache-type-k $rec_kv_flag"
+    echo "  --cache-type-v $rec_kv_flag  # f16, q8_0, or q4_0"
+    echo ""
+    echo "  # Or use --auto-context flag for auto ctx selection"
+    echo ""
+}
+
+# Calculate auto context size for --auto-context flag
+# Returns optimal ctx-size based on VRAM and model config
+calc_auto_context() {
+    local model_path="$1"
+
+    if ! parse_gguf "$model_path"; then
+        return 1
+    fi
+
+    local vram_bytes
+    if ! vram_bytes=$(get_vram); then
+        return 1
+    fi
+
+    local file_size
+    file_size=$(stat -c%s "$model_path" 2>/dev/null || echo "0")
+    local weight_mb=$(( file_size / 1048576 ))
+
+    # Reserve 2GB for OS + safety margin
+    local usable=$(( vram_bytes - 2 * 1073741824 ))
+    if (( usable <= 0 )); then
+        usable=$vram_bytes
+    fi
+
+    # Try ctx sizes from largest to smallest, find first that fits with reasonable ngl
+    local ctx_options=(65536 32768 16384 8192 4096 2048 1024)
+
+    for ctx in "${ctx_options[@]}"; do
+        # Q8 KV: 2 × block × ctx × embed × 1 byte
+        local kv_bytes=$(( GGUF_BLOCK_COUNT * ctx * GGUF_EMBEDDING * 2 ))
+        local remaining=$(( usable - kv_bytes ))
+
+        if (( remaining > 0 )); then
+            # Check if at least 1 layer fits
+            local layer_bytes=$(( weight_mb * 1048576 / GGUF_BLOCK_COUNT ))
+            if (( remaining > layer_bytes )); then
+                echo "$ctx"
+                return 0
+            fi
+        fi
+    done
+
+    # Fallback: smallest ctx
+    echo "1024"
+    return 0
+}
+
+# Calculate auto NG layers for --auto-ngl flag
+# Returns optimal ngl based on VRAM and model config
+calc_auto_ngl() {
+    local model_path="$1"
+
+    if ! parse_gguf "$model_path"; then
+        return 1
+    fi
+
+    local vram_bytes
+    if ! vram_bytes=$(get_vram); then
+        return 1
+    fi
+
+    local file_size
+    file_size=$(stat -c%s "$model_path" 2>/dev/null || echo "0")
+    local weight_mb=$(( file_size / 1048576 ))
+
+    # Reserve 4GB for OS + KV cache safety margin (conservative for small RAM)
+    local usable=$(( vram_bytes - 4 * 1073741824 ))
+    if (( usable <= 0 )); then
+        usable=$(( vram_bytes - 2 * 1073741824 ))
+        if (( usable <= 0 )); then usable=$vram_bytes; fi
+    fi
+
+    local layer_bytes=$(( weight_mb * 1048576 / GGUF_BLOCK_COUNT ))
+    if (( layer_bytes <= 0 )); then
+        echo "0"
+        return 0
+    fi
+
+    local calculated_ngl=$(( usable / layer_bytes ))
+
+    # Clamp to total layers
+    if (( calculated_ngl > GGUF_BLOCK_COUNT )); then calculated_ngl=$GGUF_BLOCK_COUNT; fi
+    if (( calculated_ngl < 0 )); then calculated_ngl=0; fi
+
+    echo "$calculated_ngl"
+    return 0
+}
+
+# --- Recommendation Command ---
+
+# dalpaca recommend <model> — prints auto-ngl / ctx-size report
+cmd_recommend() {
+    local model_name=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -*)
+                echo "Unknown flag: $1" >&2
+                echo "Usage: dalpaca recommend <model_file>" >&2
+                exit 1
+                ;;
+            *)
+                model_name="$1"
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$model_name" ]]; then
+        echo "Usage: dalpaca recommend <model_file>" >&2
+        exit 1
+    fi
+
+    local model_path
+    model_path=$(resolve_model "$model_name")
+    if [[ $? -ne 0 ]]; then exit 1; fi
+
+    calculate_recommendations "$model_path"
+}
+
+# --- Argument Parsing Helpers ---
+
+# Parse arguments into paired flags, extracting values correctly
+# Usage: parse_args "$@" -- sets global EXTRA_FLAGS array and AUTO_NGL/AUTO_CTX vars
+parse_args() {
+    EXTRA_FLAGS=()
+    AUTO_NGL=0
+    AUTO_CTX=0
+
+    local args=("$@")
+    local i=0
+    while (( i < ${#args[@]} )); do
+        local arg="${args[$i]}"
+        case "$arg" in
+            --auto-ngl)
+                AUTO_NGL=1
+                (( i++ )) || true
+                ;;
+            --auto-context)
+                AUTO_CTX=1
+                (( i++ )) || true
+                ;;
+            --ngl|--ctx-size|--threads|--temp|--cache-type-k|--cache-type-v|--host|--port)
+                # Paired flag: grab next token as value
+                if (( i + 1 < ${#args[@]} )); then
+                    EXTRA_FLAGS+=("$arg" "${args[$((i+1))]}")
+                    (( i += 2 )) || true
+                else
+                    EXTRA_FLAGS+=("$arg")
+                    (( i++ )) || true
+                fi
+                ;;
+            --system)
+                # System prompt is quoted; grab until next flag
+                local sys_args=()
+                (( i++ )) || true
+                while (( i < ${#args[@]} )); do
+                    local next="${args[$i]}"
+                    if [[ "$next" == --* ]]; then
+                        break
+                    fi
+                    sys_args+=("$next")
+                    (( i++ )) || true
+                done
+                if (( ${#sys_args[@]} > 0 )); then
+                    EXTRA_FLAGS+=("--system" "$(IFS=' '; echo "${sys_args[*]}")")
+                fi
+                ;;
+            --*)
+                EXTRA_FLAGS+=("$arg")
+                (( i++ )) || true
+                ;;
+            *)
+                # Positional arg — model name or config file
+                if [[ -z "${MODEL_ARG:-}" ]]; then
+                    MODEL_ARG="$arg"
+                else
+                    EXTRA_FLAGS+=("$arg")
+                fi
+                (( i++ )) || true
+                ;;
+        esac
+    done
+}
+
+# Find the value of a paired flag in an array of flag-value pairs
+find_flag_value() {
+    local flag="$1"; shift
+    local arr=("$@")
+    local i
+    for (( i=0; i<${#arr[@]}; i++ )); do
+        if [[ "${arr[$i]}" == "$flag" ]]; then
+            echo "${arr[$((i+1))]:-}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+
 # --- Commands ---
 
 cmd_run() {
     local config_file=""
     local model_name=""
     local file_flags=()
-    local extra_flags=()
+    local all_flags=()
 
-    # 1. Parse arguments
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -*)
-                extra_flags+=("$1")
-                shift
-                ;;
-            *)
-                config_file="$1"
-                shift
-                ;;
-        esac
-    done
+    # 1. Parse arguments with proper flag-value pairing
+    parse_args "$@"
+    local user_flag_count=${#EXTRA_FLAGS[@]}
+    config_file="${MODEL_ARG:-}"
 
     if [[ -z "$config_file" ]]; then
         echo "Usage: dalpaca run <model_filename.txt | model_name>" >&2
@@ -203,48 +841,84 @@ cmd_run() {
     fi
 
     if [[ -f "$config_file" ]]; then
-        echo "📄 Using configuration from: $config_file"
-        model_name=$(grep -E '^-m ' "$config_file" | awk '{print $2}')
-        while IFS= read -r flag; do
-            [[ -z "$flag" || "$flag" =~ ^# ]] && continue
-            file_flags+=("$flag")
-        done < <(grep -v '^-m ' "$config_file")
+        # Detect if it's a GGUF binary or a text config file
+        local magic
+        magic=$(dd if="$config_file" bs=1 count=4 2>/dev/null | od -A n -t x1 | tr -d ' \n')
+        if [[ "$magic" == "47475546" ]]; then
+            # Direct GGUF binary — use as model path directly
+            model_name="$config_file"
+        else
+            # Text config file — parse flags from it
+            echo "📄 Using configuration from: $config_file"
+            model_name=$(grep -aE '^-m ' "$config_file" | awk '{print $2}')
+            while IFS= read -r flag; do
+                [[ -z "$flag" || "$flag" =~ ^# ]] && continue
+                if [[ "$flag" == --system* ]]; then
+                    local sys_val="${flag#--system}"
+                    sys_val="${sys_val#"${sys_val%%[![:space:]]*}"}"
+                    if [[ "$sys_val" == \"*\" ]]; then
+                        sys_val="${sys_val#\"}"; sys_val="${sys_val%\"}"
+                    fi
+                    file_flags+=("--system" "$sys_val")
+                else
+                    file_flags+=( $flag )
+                fi
+            done < <(grep -v '^-m ' "$config_file")
+        fi
 
     else
         model_name=$(resolve_model "$config_file")
         if [[ $? -ne 0 ]]; then exit 1; fi
     fi
 
-    local all_flags=($DEFAULT_FLAGS "${file_flags[@]}" "${extra_flags[@]}")
+    # 1b. Auto-NGL: calculate and inject --ngl if requested
+    if (( AUTO_NGL )); then
+        local calculated_ngl
+        if calculated_ngl=$(calc_auto_ngl "$model_name"); then
+            EXTRA_FLAGS+=("--ngl" "$calculated_ngl")
+            echo "💡 Auto-NGL: calculated $calculated_ngl layers"
+        fi
+    fi
+
+    # 1c. Auto-context: calculate and inject --ctx-size if requested
+    if (( AUTO_CTX )); then
+        local auto_ctx_val
+        if auto_ctx_val=$(calc_auto_context "$model_name"); then
+            EXTRA_FLAGS+=("--ctx-size" "$auto_ctx_val")
+            echo "💡 Auto-Context: calculated ctx-size $auto_ctx_val"
+        fi
+    fi
+
+    # Combine flags: defaults only when no user-specified flags (config or CLI)
+    local defaults=()
+    if (( user_flag_count == 0 )) && (( ${#file_flags[@]} == 0 )); then
+        defaults=($DEFAULT_FLAGS)
+    fi
+    all_flags=("${defaults[@]}" "${file_flags[@]}" "${EXTRA_FLAGS[@]}")
 
     if [[ -z "$model_name" ]]; then
         echo "Error: No model path (-m) found in config or argument." >&2
         exit 1
     fi
 
+    local llama_cli_bin
+    llama_cli_bin=$(resolve_llama_cmd "llama-cli")
+    if [[ $? -ne 0 ]]; then exit 1; fi
+
     echo "🚀 Starting '$model_name' in CLI MODE (Foreground)..."
-    $CLI_CMD -m "$model_name" "${all_flags[@]}"
+    "$llama_cli_bin" -m "$model_name" "${all_flags[@]}"
 }
 
 cmd_server() {
     local config_file=""
     local model_name=""
     local file_flags=()
-    local extra_flags=()
+    local all_flags=()
 
-    # 1. Parse arguments
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -*)
-                extra_flags+=("$1")
-                shift
-                ;;
-            *)
-                config_file="$1"
-                shift
-                ;;
-        esac
-    done
+    # 1. Parse arguments with proper flag-value pairing
+    parse_args "$@"
+    local user_flag_count=${#EXTRA_FLAGS[@]}
+    config_file="${MODEL_ARG:-}"
 
     if [[ -z "$config_file" ]]; then
         echo "Usage: dalpaca server <model_filename.txt | model_name>" >&2
@@ -258,30 +932,84 @@ cmd_server() {
     fi
 
     if [[ -f "$config_file" ]]; then
-        echo "📄 Using configuration from: $config_file"
-        model_name=$(grep -E '^-m ' "$config_file" | awk '{print $2}')
-        while IFS= read -r flag; do
-            [[ -z "$flag" || "$flag" =~ ^# ]] && continue
-            file_flags+=("$flag")
-        done < <(grep -v '^-m ' "$config_file")
+        # Detect if it's a GGUF binary or a text config file
+        local magic
+        magic=$(dd if="$config_file" bs=1 count=4 2>/dev/null | od -A n -t x1 | tr -d ' \n')
+        if [[ "$magic" == "47475546" ]]; then
+            # Direct GGUF binary — use as model path directly
+            model_name="$config_file"
+        else
+            # Text config file — parse flags from it
+            echo "📄 Using configuration from: $config_file"
+            model_name=$(grep -aE '^-m ' "$config_file" | awk '{print $2}')
+            while IFS= read -r flag; do
+                [[ -z "$flag" || "$flag" =~ ^# ]] && continue
+                if [[ "$flag" == --system* ]]; then
+                    local sys_val="${flag#--system}"
+                    sys_val="${sys_val#"${sys_val%%[![:space:]]*}"}"
+                    if [[ "$sys_val" == \"*\" ]]; then
+                        sys_val="${sys_val#\"}"; sys_val="${sys_val%\"}"
+                    fi
+                    file_flags+=("--system" "$sys_val")
+                else
+                    file_flags+=( $flag )
+                fi
+            done < <(grep -v '^-m ' "$config_file")
+        fi
 
     else
         model_name=$(resolve_model "$config_file")
         if [[ $? -ne 0 ]]; then exit 1; fi
     fi
 
-    # Add default server flags
-    local server_defaults=($DEFAULT_FLAGS --port 11434 --host 127.0.0.1)
-    local all_flags=("${server_defaults[@]}" "${file_flags[@]}" "${extra_flags[@]}")
+    # 1b. Auto-NGL: calculate and inject --ngl if requested
+    if (( AUTO_NGL )); then
+        local calculated_ngl
+        if calculated_ngl=$(calc_auto_ngl "$model_name"); then
+            EXTRA_FLAGS+=("--ngl" "$calculated_ngl")
+            echo "💡 Auto-NGL: calculated $calculated_ngl layers"
+        fi
+    fi
+
+    # 1c. Auto-context: calculate and inject --ctx-size if requested
+    if (( AUTO_CTX )); then
+        local auto_ctx_val
+        if auto_ctx_val=$(calc_auto_context "$model_name"); then
+            EXTRA_FLAGS+=("--ctx-size" "$auto_ctx_val")
+            echo "💡 Auto-Context: calculated ctx-size $auto_ctx_val"
+        fi
+    fi
+
+    # Combine flags: server defaults only when no user-specified flags
+    local defaults=()
+    if (( user_flag_count == 0 )) && (( ${#file_flags[@]} == 0 )); then
+        defaults=($DEFAULT_FLAGS --port 11434 --host 127.0.0.1)
+    fi
+    all_flags=("${defaults[@]}" "${file_flags[@]}" "${EXTRA_FLAGS[@]}")
 
     if [[ -z "$model_name" ]]; then
         echo "Error: No model path (-m) found in config or argument." >&2
         exit 1
     fi
 
+    local llama_server_bin
+    llama_server_bin=$(resolve_llama_cmd "llama-server")
+    if [[ $? -ne 0 ]]; then exit 1; fi
+
+    # Resolve effective port/host for the message (user-specified values)
+    local port="11434" host="127.0.0.1"
+    local p_val
+    if p_val=$(find_flag_value "--port" "${EXTRA_FLAGS[@]}"); then port="$p_val"
+    elif p_val=$(find_flag_value "--port" "${file_flags[@]}"); then port="$p_val"
+    elif p_val=$(find_flag_value "--port" "${defaults[@]}"); then port="$p_val"
+    fi
+    if p_val=$(find_flag_value "--host" "${EXTRA_FLAGS[@]}"); then host="$p_val"
+    elif p_val=$(find_flag_value "--host" "${file_flags[@]}"); then host="$p_val"
+    elif p_val=$(find_flag_value "--host" "${defaults[@]}"); then host="$p_val"
+    fi
     echo "🚀 Starting '$model_name' in SERVER MODE (Daemonized)..."
-    nohup $SERVER_CMD -m "$model_name" "${all_flags[@]}" > /dev/null 2>&1 &
-    echo "✅ Process started. Access at http://localhost:11434"
+    nohup "$llama_server_bin" -m "$model_name" "${all_flags[@]}" > /dev/null 2>&1 &
+    echo "✅ Process started. Access at http://$host:$port"
 }
 
 cmd_stop() {
@@ -305,41 +1033,266 @@ cmd_ps() {
 }
 
 cmd_help() {
-    echo "dalpaca: Local LLM Manager"
+    echo "dalpaca v$DALPACA_VERSION — Local LLM Manager"
     echo ""
     echo "Usage:"
-    echo "  dalpaca run <model_name>              Run in CLI mode (Interactive)"
-    echo "  dalpaca run ./config.txt              Run using a config file"
-    echo "  dalpaca server <model_name>           Run in Server mode (Daemonized/Web UI)"
-    echo "  dalpaca server <config.txt>           Run server using a config file"
-    echo "  dalpaca stop                          Stop all models"
-    echo "  dalpaca ps                          Show running models"
+    echo "  dalpaca                              Interactive wizard (TUI)"
+    echo "  dalpaca run <model>                  Run in CLI mode (interactive)"
+    echo "  dalpaca run ./config.txt             Run using a config file"
+    echo "  dalpaca server <model|config>        Run server (Web UI / API)"
+    echo "  dalpaca recommend <model_file>       Show GPU offload & context report"
+    echo "  dalpaca stop                         Stop all instances"
+    echo "  dalpaca ps                           Show running models"
     echo "  dalpaca register <name> -f <config>  Register a model config"
-    echo "  dalpaca list                          List registered models"
-    echo "  dalpaca rm <name>                     Remove a registered model"
+    echo "  dalpaca list                         List registered models"
+    echo "  dalpaca rm <name>                    Remove a registered model"
+    echo "  dalpaca set-llama [directory]        Set llama.cpp build directory"
+    echo "  dalpaca help                         Show this help"
+    echo ""
+    echo "Auto flags (run/server):"
+    echo "  --auto-ngl             Auto-calculate optimal GPU layer count"
+    echo "  --auto-context         Auto-calculate optimal context size"
     echo ""
     echo "Config file (.txt) format:"
     echo "  -m /path/to/model.gguf"
-    echo "  --ngl 40"
-    echo "  --ctx-size 65536"
+    echo "  --ngl <int>"
+    echo "  --ctx-size <int>"
+    echo "  --threads <int>"
+    echo "  --temp <float>"
+    echo "  --cache-type-k <f16|q8_0|q4_0>  KV cache key quantization"
+    echo "  --cache-type-v <f16|q8_0|q4_0>  KV cache value quantization"
     echo "  --system \"Your system prompt here\""
+    echo "  --numa  --flash-attn"
+    echo ""
+    echo "Note: If you specify any llama.cpp flag (via CLI or config file), dalpaca's"
+    echo "built-in defaults (--mlock --ngl 52 --ctx-size 32768 --threads 16 --numa"
+    echo "--flash-attn --temp 0.7) are not applied."
 }
+
+# --- Interactive Wizard (no-arg TUI) ---
+
+cmd_wizard() {
+    # Needs a real TTY; otherwise fall back to help
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        cmd_help
+        return 0
+    fi
+
+    local prev_stty
+    prev_stty=$(stty -g 2>/dev/null) || { cmd_help; return 0; }
+    stty -echo 2>/dev/null || true
+
+    _wiz_cleanup() { stty "$prev_stty" 2>/dev/null || true; }
+    trap '_wiz_cleanup' EXIT INT TERM
+
+    # Build choice list
+    local names=()
+    local f base
+    for f in "$DALPACA_HOME"/*.txt; do
+        [[ -f "$f" ]] || continue
+        base=$(basename "$f" .txt)
+        [[ "$base" == "llama_dir" ]] && continue
+        names+=("$base")
+    done
+    names+=("__new__")
+    local max_idx=$(( ${#names[@]} - 1 ))
+    local sel=0
+    local mode="list"       # list | action | import | name
+    local act_sel=0
+    local import_path=""
+    local new_name=""
+
+    # Read one keypress
+    _wiz_key() {
+        local key
+        IFS= read -r -s -n1 key 2>/dev/null || return 1
+        if [[ "$key" == $'\x1b' ]]; then
+            local rest=""
+            IFS= read -r -s -n2 -t 0.05 rest 2>/dev/null || rest=""
+            case "$rest" in
+                *"[A"|*OA) printf 'up' ;;
+                *"[B"|*OB) printf 'down' ;;
+                *) printf '' ;;
+            esac
+        else
+            printf '%s' "$key"
+        fi
+    }
+
+    # Draw screen
+    _wiz_draw() {
+        clear
+        printf '\n'
+        printf '  dalpaca  v%s\n' "$DALPACA_VERSION"
+        if [[ -n "$LLAMA_DIR" ]]; then
+            printf '  llama.cpp: %s\n' "$LLAMA_DIR"
+        else
+            printf '  llama.cpp: (not set — using PATH)\n'
+        fi
+        printf '  ─────────────────────────────────────────────────\n'
+
+        if [[ "$mode" == "list" ]]; then
+            printf '  ── Registered Models ──────────────────────\n'
+            local i
+            for i in "${!names[@]}"; do
+                local label
+                if [[ "${names[$i]}" == "__new__" ]]; then
+                    label="➕  New from file…"
+                else
+                    label="${names[$i]}"
+                fi
+                if (( i == sel )); then
+                    printf '  ▶ %s\n' "$label"
+                else
+                    printf '    %s\n' "$label"
+                fi
+            done
+            printf '  ─────────────────────────────────────────────────\n'
+            printf '  ↑/↓ navigate · Enter select · q quit\n'
+
+        elif [[ "$mode" == "action" ]]; then
+            printf '  ── %s ────────────────────────────────────\n' "${names[$sel]}"
+            local opts=("  ▶ CLI — interactive foreground"
+                       "  ▶ Server — background daemon"
+                       "  ◀  Back")
+            local i
+            for i in "${!opts[@]}"; do
+                if (( i == act_sel )); then
+                    printf '  %s\n' "${opts[$i]}"
+                else
+                    printf '    %s\n' "${opts[$i]}"
+                fi
+            done
+            printf '  ─────────────────────────────────────────────────\n'
+            printf '  ↑/↓ navigate · Enter select · q quit\n'
+
+        elif [[ "$mode" == "import" ]]; then
+            printf '  New from file\n'
+            printf '  ─────────────────────────────────────────────────\n'
+            if [[ -n "$import_path" ]]; then
+                printf '  Config file: %s\n' "$import_path"
+            else
+                printf '  Config file: (enter path)\n'
+            fi
+            printf '  ─────────────────────────────────────────────────\n'
+            printf '  Enter to continue · q cancel\n'
+
+        elif [[ "$mode" == "name" ]]; then
+            printf '  Register: %s\n' "$import_path"
+            printf '  ─────────────────────────────────────────────────\n'
+            if [[ -n "$new_name" ]]; then
+                printf '  Name: %s\n' "$new_name"
+            else
+                printf '  Name: (enter name)\n'
+            fi
+            printf '  ─────────────────────────────────────────────────\n'
+            printf '  Enter to register · q cancel\n'
+        fi
+    }
+
+    # Main loop
+    local key
+    while :; do
+        _wiz_draw
+
+        key=$(_wiz_key) || key="EOF"
+
+        case "$key" in
+            "up")
+                case "$mode" in
+                    "list")  (( sel > 0 )) && sel=$(( sel - 1 )) || true ;;
+                    "action") act_sel=$(( (act_sel + 2) % 3 )) || true ;;
+                esac
+                ;;
+            "down")
+                case "$mode" in
+                    "list")  (( sel < max_idx )) && sel=$(( sel + 1 )) || true ;;
+                    "action") act_sel=$(( (act_sel + 1) % 3 )) || true ;;
+                esac
+                ;;
+            $'\n' | $'\r' | ' ')
+                case "$mode" in
+                    "list")
+                        if [[ "${names[$sel]}" == "__new__" ]]; then
+                            mode="import"
+                            import_path=""
+                        else
+                            mode="action"
+                            act_sel=0
+                        fi
+                        ;;
+                    "action")
+                        case $act_sel in
+                            0) _wiz_cleanup; cmd_run "${names[$sel]}"; return 0 ;;
+                            1) _wiz_cleanup; cmd_server "${names[$sel]}"; return 0 ;;
+                            2) mode="list" ;;
+                        esac
+                        ;;
+                    "import")
+                        if [[ -n "$import_path" && -f "$import_path" ]]; then
+                            mode="name"
+                            new_name=""
+                        fi
+                        ;;
+                    "name")
+                        if [[ -n "$new_name" ]]; then
+                            cp "$import_path" "$DALPACA_HOME/${new_name}.txt"
+                            names=()
+                            for f in "$DALPACA_HOME"/*.txt; do
+                                [[ -f "$f" ]] || continue
+                                base=$(basename "$f" .txt)
+                                [[ "$base" == "llama_dir" ]] && continue
+                                names+=("$base")
+                            done
+                            names+=("__new__")
+                            max_idx=$(( ${#names[@]} - 1 ))
+                            local idx=0
+                            for n in "${names[@]}"; do
+                                if [[ "$n" == "$new_name" ]]; then
+                                    sel=$idx
+                                    break
+                                fi
+                                idx=$(( idx + 1 ))
+                            done
+                            mode="action"
+                            act_sel=0
+                        fi
+                        ;;
+                esac
+                ;;
+            q | Q) _wiz_cleanup; return 0 ;;
+            $'\x1b')
+                case "$mode" in
+                    "action"|"import"|"name") mode="list" ;;
+                    *) _wiz_cleanup; return 0 ;;
+                esac
+                ;;
+            $'\x7f')
+                case "$mode" in
+                    "import") import_path="${import_path%?}" ;;
+                    "name") new_name="${new_name%?}" ;;
+                esac
+                ;;
+            "EOF") _wiz_cleanup; return 0 ;;
+        esac
+    done
+}
+
+load_llama_config
 
 # --- Main Dispatcher ---
 
 if [[ $# -eq 0 ]]; then
-    cmd_help
+    cmd_wizard
     exit 0
 fi
 
 case "$1" in
-    run)    shift; cmd_run "$@" ;;
-    server) shift; cmd_server "$@" ;;
-    stop)   cmd_stop ;;
-    ps) cmd_ps ;;
-    register) shift; cmd_register "$@" ;;
-    list|ls)  cmd_list ;;
-    rm)       shift; cmd_rm "$@" ;;
-    help)   cmd_help ;;
-    *)      echo "Unknown command: $1"; cmd_help; exit 1 ;;
+    run)        shift; cmd_run "$@" ;;
+    server)     shift; cmd_server "$@" ;;
+    stop)       cmd_stop ;;
+    ps)         cmd_ps ;;
+    set-llama)  shift; cmd_set_llama "$@" ;;
+    recommend)  shift; cmd_recommend "$@" ;;
+    help|--help|-h) cmd_help ;;
 esac
